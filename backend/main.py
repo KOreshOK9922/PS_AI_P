@@ -1,14 +1,12 @@
 """
-PS AI Agent — Backend Server v2.0
-С параллельными агентами и базой знаний
+PS AI Agent — Backend Server v3.0
+Оркестратор для автоматизации Plant Simulation 2404
 
 Запуск: python backend/main.py
 API: http://localhost:7860
 """
 
 import asyncio
-import json
-import time
 import traceback
 import sys
 from contextlib import asynccontextmanager
@@ -16,16 +14,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
+from orchestrator import Orchestrator
 from plant_sim import PlantSimConnection
-from parallel_agents import SupervisorAgent, AgentStatus
 from knowledge_base import kb
 
 # ─── Global State ─────────────────────────────────────────────────────
@@ -40,8 +38,7 @@ class AppState:
         self.objects: list[dict] = []
         self.agent_statuses: dict = {}
         self.current_task: Optional[asyncio.Task] = None
-        self.ps: Optional[PlantSimConnection] = None
-        self.supervisor: Optional[SupervisorAgent] = None
+        self.orchestrator: Optional[Orchestrator] = None
 
 state = AppState()
 
@@ -66,7 +63,7 @@ def add_log(level: str, agent: str, msg: str):
 class RunRequest(BaseModel):
     description: str
     output_path: str = "model.spp"
-    parallel_research: bool = False
+    max_iterations: int = 3
 
 class ResearchRequest(BaseModel):
     task: str = "full"
@@ -75,15 +72,15 @@ class ResearchRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    add_log("INFO", "SYSTEM", "PS AI Agent Backend v2.0 запущен")
-    add_log("INFO", "SYSTEM", "Параллельные агенты + база знаний")
+    add_log("INFO", "SYSTEM", "PS AI Agent Backend v3.0 запущен")
+    add_log("INFO", "SYSTEM", "Оркестратор для Plant Simulation 2404")
     add_log("INFO", "SYSTEM", "API: http://localhost:7860")
     yield
     add_log("INFO", "SYSTEM", "Backend остановлен")
 
 # ─── FastAPI App ──────────────────────────────────────────────────────
 
-app = FastAPI(title="PS AI Agent v2.0", lifespan=lifespan)
+app = FastAPI(title="PS AI Agent v3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -97,7 +94,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    """Корневой маршрут - отдаёт frontend"""
+    """Корневой маршрут"""
     dist_dir = Path(__file__).parent.parent / "dist"
     index_file = dist_dir / "index.html"
     
@@ -111,21 +108,18 @@ async def root():
             <head>
                 <title>PS AI Agent - Backend Running</title>
                 <style>
-                    body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+                    body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; background: #030712; color: #e5e7eb; }
                     h1 { color: #3b82f6; }
                     .success { color: #10b981; }
                     .warning { color: #f59e0b; }
                     code { background: #1f2937; color: #10b981; padding: 2px 6px; border-radius: 4px; }
                     pre { background: #1f2937; color: #e5e7eb; padding: 15px; border-radius: 8px; overflow-x: auto; }
+                    a { color: #3b82f6; }
                 </style>
             </head>
             <body>
                 <h1>🏭 PS AI Agent Backend</h1>
                 <p class="success">✅ Backend работает успешно!</p>
-                
-                <h2>⚠️ Frontend не собран</h2>
-                <p>Для работы веб-интерфейса выполните:</p>
-                <pre>npm run build</pre>
                 
                 <h2>📚 API Документация</h2>
                 <ul>
@@ -134,17 +128,9 @@ async def root():
                     <li><a href="/health">Health Check</a> - проверка статуса</li>
                 </ul>
                 
-                <h2>🚀 Быстрый старт</h2>
-                <pre>
-# 1. Соберите frontend
-npm run build
-
-# 2. Перезапустите backend
-python backend/main.py
-
-# 3. Откройте браузер
-http://localhost:7860
-                </pre>
+                <h2>⚠️ Frontend не собран</h2>
+                <p>Для работы веб-интерфейса выполните:</p>
+                <pre>npm run build</pre>
             </body>
             </html>
             """,
@@ -200,7 +186,7 @@ async def get_classes():
 
 @app.post("/run")
 async def run_agent(req: RunRequest):
-    """Запустить полный цикл с параллельными агентами"""
+    """Запустить построение модели в Plant Simulation"""
     if state.current_task and not state.current_task.done():
         return {"error": "Уже выполняется задача"}
     
@@ -212,70 +198,54 @@ async def run_agent(req: RunRequest):
     
     async def task():
         try:
-            # Инициализация
-            add_log("INFO", "SYSTEM", "Инициализация системы...")
+            add_log("INFO", "SYSTEM", "Инициализация оркестратора...")
             state.state = "connecting"
             
-            ps = PlantSimConnection()
-            state.ps = ps
-            connected = ps.check_connection()
+            # Создаём оркестратор
+            orchestrator = Orchestrator(
+                description=req.description,
+                output_path=req.output_path,
+                max_iterations=req.max_iterations,
+                log_fn=add_log
+            )
+            state.orchestrator = orchestrator
             
-            if connected:
-                add_log("SUCCESS", "SYSTEM", f"Plant Simulation подключен ({ps.method.value})")
-            else:
-                add_log("WARN", "SYSTEM", "Plant Simulation в демо-режиме")
+            # Запускаем построение модели
+            state.state = "running"
+            result = await orchestrator.run()
             
-            # Создаём супервизора
-            supervisor = SupervisorAgent(add_log, ps)
-            state.supervisor = supervisor
+            # Обновляем состояние
+            if result.get("spec"):
+                state.spec = result["spec"]
+                state.objects = [
+                    {
+                        "name": obj["name"],
+                        "class": obj["class"],
+                        "x": obj.get("x", 0),
+                        "y": obj.get("y", 0),
+                        "params": obj.get("params", {}),
+                    }
+                    for obj in result["spec"].get("objects", [])
+                ]
             
-            # Если запрошено параллельное исследование
-            if req.parallel_research:
-                add_log("INFO", "SYSTEM", "Запуск параллельного исследования...")
-                state.state = "researching"
-                research_result = await supervisor.run_parallel_research()
-                add_log("SUCCESS", "SYSTEM", f"Исследование завершено")
-            
-            # Запускаем основной конвейер
-            state.state = "parsing"
-            add_log("INFO", "Supervisor", "Запуск конвейера обработки")
-            
-            result = await supervisor.run_pipeline(req.description)
+            if result.get("code"):
+                state.code = result["code"]
             
             # Обновляем статусы агентов
             state.agent_statuses = {
-                "Architect": supervisor.architect.status.value,
-                "Builder": supervisor.builder.status.value,
-                "Executor": supervisor.executor.status.value,
-                "Debugger": supervisor.debugger.status.value,
-                "Validator": supervisor.validator.status.value,
+                "Architect": orchestrator.architect.status,
+                "Builder": orchestrator.builder.status,
+                "Executor": orchestrator.executor.status,
+                "Debugger": orchestrator.debugger.status,
+                "Validator": orchestrator.validator.status,
             }
             
-            if result["success"]:
-                state.spec = result.get("spec")
-                state.code = result.get("code")
-                
-                # Обновляем объекты для UI
-                if state.spec:
-                    state.objects = []
-                    for obj in state.spec["objects"]:
-                        state.objects.append({
-                            "name": obj["name"],
-                            "class": obj["class"],
-                            "x": obj.get("x", 0),
-                            "y": obj.get("y", 0),
-                            "params": obj.get("params", {}),
-                        })
-                
-                # Сохраняем модель
-                add_log("INFO", "SYSTEM", f"Сохранение модели: {req.output_path}")
-                ps.save_model(req.output_path)
-                
+            if result.get("success"):
                 state.state = "done"
-                add_log("SUCCESS", "SYSTEM", "✅ Модель создана и сохранена!")
+                add_log("SUCCESS", "SYSTEM", f"✅ Модель построена за {result.get('elapsed', 0):.1f} сек")
             else:
                 state.state = "error"
-                add_log("ERROR", "SYSTEM", f"Ошибка: {result.get('error')}")
+                add_log("ERROR", "SYSTEM", f"❌ Ошибка: {result.get('error')}")
             
         except Exception as e:
             add_log("ERROR", "SYSTEM", f"Критическая ошибка: {str(e)}")
@@ -287,7 +257,7 @@ async def run_agent(req: RunRequest):
 
 @app.post("/research")
 async def run_research(req: ResearchRequest):
-    """Запустить исследование API"""
+    """Запустить исследование API Plant Simulation"""
     if state.current_task and not state.current_task.done():
         return {"error": "Уже выполняется задача"}
     
@@ -295,25 +265,21 @@ async def run_research(req: ResearchRequest):
     
     async def task():
         try:
-            ps = PlantSimConnection()
-            ps.check_connection()
+            orchestrator = Orchestrator(
+                description="",
+                log_fn=add_log
+            )
+            state.orchestrator = orchestrator
             
-            supervisor = SupervisorAgent(add_log, ps)
-            state.supervisor = supervisor
+            add_log("INFO", "SYSTEM", f"Запуск исследования: {req.task}")
+            result = await orchestrator.run_research(req.task)
             
-            add_log("INFO", "Researcher", f"Запуск исследования: {req.task}")
-            
-            from parallel_agents import ResearcherAgent
-            researcher = ResearcherAgent(add_log, ps)
-            
-            result = await researcher.execute(req.task)
-            
-            if result.success:
-                add_log("SUCCESS", "Researcher", "Исследование завершено")
+            if result.get("success"):
                 state.state = "done"
+                add_log("SUCCESS", "SYSTEM", "✅ Исследование завершено")
             else:
-                add_log("ERROR", "Researcher", f"Ошибка: {result.error}")
                 state.state = "error"
+                add_log("ERROR", "SYSTEM", f"❌ Ошибка: {result.get('error')}")
             
         except Exception as e:
             add_log("ERROR", "SYSTEM", f"Ошибка: {e}")
@@ -409,8 +375,7 @@ if DIST_DIR.exists() and (DIST_DIR / "assets").exists():
     
     @app.get("/{path:path}")
     async def serve_frontend(path: str):
-        # Не перехватываем API маршруты
-        if path.startswith("api/") or path in ["docs", "redoc", "openapi.json", "health", "logs", "status", "agents", "knowledge"]:
+        if path.startswith("api/") or path in ["docs", "redoc", "openapi.json"]:
             raise HTTPException(status_code=404, detail="Not found")
         
         file_path = DIST_DIR / path
@@ -423,9 +388,8 @@ if DIST_DIR.exists() and (DIST_DIR / "assets").exists():
 if __name__ == "__main__":
     import uvicorn
     print("=" * 60)
-    print("  PS AI Agent v2.0 — Backend Server")
-    print("  Параллельные агенты + база знаний")
+    print("  PS AI Agent v3.0 — Backend Server")
+    print("  Оркестратор для Plant Simulation 2404")
     print("  API: http://localhost:7860")
-    print("  Plant Simulation 2404")
     print("=" * 60)
     uvicorn.run(app, host="0.0.0.0", port=7860)

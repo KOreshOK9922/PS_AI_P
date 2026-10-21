@@ -1,135 +1,220 @@
 """
-Оркестратор - управляет жизненным циклом задачи
+Оркестратор для Plant Simulation AI Agent
+Управляет полным циклом построения модели в PS 2404
+
+Агенты специализированы именно на работе с Plant Simulation:
+- Architect: парсит описание линии → JSON-спецификация
+- Builder: JSON → SimTalk код (createObject, Connector.connect)
+- Executor: выполняет код через COM/REST/Python Interface
+- Debugger: анализирует ошибки COM, ищет решения в БЗ
+- Researcher: тестирует методы API PS
+- Validator: проверяет корректность модели
 """
 
 import asyncio
+import time
 from typing import Callable, Optional
 
-from agents.analyst import ProductAnalyst
-from agents.architect import SystemArchitect
-from agents.engineer import LeadEngineer
-from agents.qa import QAEngineer
-from agents.reviewer import CodeReviewer
-from agents.devops import DevOpsEngineer
-from llm_client import OllamaClient
+from parallel_agents import (
+    SupervisorAgent,
+    ArchitectAgent,
+    BuilderAgent,
+    ExecutorAgent,
+    DebuggerAgent,
+    ResearcherAgent,
+    ValidatorAgent,
+)
+from plant_sim import PlantSimConnection
+from knowledge_base import kb
 
 
 class Orchestrator:
-    """Оркестратор мультиагентной системы"""
+    """Оркестратор для Plant Simulation"""
     
     def __init__(
         self,
-        task_id: str,
-        requirement: str,
+        description: str,
+        output_path: str = "model.spp",
         max_iterations: int = 3,
-        log_fn: Optional[Callable] = None
+        log_fn: Optional[Callable] = None,
     ):
-        self.task_id = task_id
-        self.requirement = requirement
+        self.description = description
+        self.output_path = output_path
         self.max_iterations = max_iterations
-        self.log = log_fn or (lambda agent, msg, level="INFO": print(f"[{agent}] {msg}"))
+        self.log = log_fn or (lambda level, agent, msg: print(f"[{level}] [{agent}] {msg}"))
         
-        # Инициализируем LLM клиент
-        self.llm = OllamaClient()
+        # Подключение к Plant Simulation
+        self.ps = PlantSimConnection()
         
-        # Инициализируем агентов
-        self.analyst = ProductAnalyst(self.llm, self.log)
-        self.architect = SystemArchitect(self.llm, self.log)
-        self.engineer = LeadEngineer(self.llm, self.log)
-        self.qa = QAEngineer(self.llm, self.log)
-        self.reviewer = CodeReviewer(self.llm, self.log)
-        self.devops = DevOpsEngineer(self.llm, self.log)
+        # Создаём агентов, специализированных на Plant Simulation
+        self.supervisor = SupervisorAgent(self.log, self.ps)
+        self.architect = ArchitectAgent(self.log)
+        self.builder = BuilderAgent(self.log)
+        self.executor = ExecutorAgent(self.log, self.ps)
+        self.debugger = DebuggerAgent(self.log)
+        self.researcher = ResearcherAgent(self.log, self.ps)
+        self.validator = ValidatorAgent(self.log, self.ps)
         
-        # Состояние задачи
-        self.artifacts = {}
-        self.current_iteration = 0
+        # Состояние
+        self.spec = None
+        self.code = ""
+        self.iteration = 0
     
     async def run(self) -> dict:
-        """Запускает полный workflow"""
+        """Запускает полный цикл построения модели в Plant Simulation"""
+        start_time = time.time()
+        
         try:
-            self.log("Orchestrator", "🚀 Начало выполнения задачи")
+            self.log("INFO", "Orchestrator", "🚀 Начало построения модели Plant Simulation")
             
-            # Фаза 1: Анализ требований
-            self.log("Orchestrator", "📊 Фаза 1: Анализ требований")
-            requirements = await self.analyst.analyze(self.requirement)
-            self.artifacts["requirements.md"] = requirements
-            self.log("Product Analyst", "✅ Требования сформированы")
+            # Фаза 1: Подключение к PS
+            self.log("INFO", "Orchestrator", "🔌 Фаза 1: Подключение к Plant Simulation")
+            connected = self.ps.check_connection()
+            if connected:
+                self.log("SUCCESS", "Orchestrator", f"✅ Подключено через {self.ps.method.value}")
+            else:
+                self.log("WARN", "Orchestrator", "⚠️ Демо-режим (PS не подключен)")
             
-            # Фаза 2: Проектирование архитектуры
-            self.log("Orchestrator", "🏛️ Фаза 2: Проектирование архитектуры")
-            architecture = await self.architect.design(requirements)
-            self.artifacts["architecture.md"] = architecture
-            self.log("System Architect", "✅ Архитектура спроектирована")
+            # Фаза 2: Парсинг описания (Architect)
+            self.log("INFO", "Orchestrator", "🏗️ Фаза 2: Архитектор анализирует описание")
+            self.architect.status = "working"
+            spec_result = await self.architect.execute(self.description)
             
-            # Фаза 3-6: Цикл реализации и проверки
-            code = None
-            tests = None
-            review_report = None
+            if not spec_result.success:
+                self.log("ERROR", "Orchestrator", f"❌ Архитектор не смог распарсить: {spec_result.error}")
+                return {"success": False, "error": "Архитектор не смог распарсить описание"}
+            
+            self.spec = spec_result.data
+            self.architect.status = "done"
+            self.log("SUCCESS", "Orchestrator", f"✅ Спецификация: {len(self.spec['objects'])} объектов, {len(self.spec['connections'])} соединений")
+            
+            # Фаза 3: Генерация SimTalk кода (Builder)
+            self.log("INFO", "Orchestrator", "🔨 Фаза 3: Строитель генерирует SimTalk код")
+            self.builder.status = "working"
+            build_result = await self.builder.execute(self.spec)
+            
+            if not build_result.success:
+                self.log("ERROR", "Orchestrator", f"❌ Строитель не смог сгенерировать код: {build_result.error}")
+                return {"success": False, "error": "Строитель не смог сгенерировать код"}
+            
+            self.code = build_result.data
+            self.builder.status = "done"
+            self.log("SUCCESS", "Orchestrator", f"✅ Сгенерировано {len(self.code.splitlines())} строк SimTalk")
+            
+            # Фаза 4: Выполнение кода с циклом отладки
+            self.log("INFO", "Orchestrator", "⚡ Фаза 4: Исполнитель выполняет код")
             
             for iteration in range(1, self.max_iterations + 1):
-                self.current_iteration = iteration
-                self.log("Orchestrator", f"🔄 Итерация {iteration}/{self.max_iterations}")
+                self.iteration = iteration
+                self.log("INFO", "Orchestrator", f"🔄 Итерация {iteration}/{self.max_iterations}")
                 
-                # Фаза 3: Реализация кода
-                self.log("Orchestrator", "💻 Фаза 3: Реализация кода")
-                code = await self.engineer.implement(requirements, architecture, review_report)
-                self.artifacts["code"] = code
-                self.log("Lead Engineer", "✅ Код реализован")
+                # Выполнение
+                self.executor.status = "working"
+                self.ps.new_model()
+                exec_result = await self.executor.execute(self.code)
                 
-                # Фаза 4: Тестирование
-                self.log("Orchestrator", "🧪 Фаза 4: Тестирование")
-                tests = await self.qa.test(code, requirements)
-                self.artifacts["tests"] = tests
-                
-                if tests.get("passed", False):
-                    self.log("QA Engineer", "✅ Все тесты пройдены")
-                else:
-                    self.log("QA Engineer", f"❌ Тесты не пройдены: {tests.get('failures', [])}", "WARN")
-                    review_report = {"type": "qa_failures", "issues": tests.get("failures", [])}
-                    continue
-                
-                # Фаза 5: Ревью кода
-                self.log("Orchestrator", "🔍 Фаза 5: Ревью кода")
-                review = await self.reviewer.review(code, architecture)
-                self.artifacts["review.md"] = review
-                
-                if review.get("approved", False):
-                    self.log("Code Reviewer", "✅ Код одобрен")
+                if exec_result.success:
+                    self.executor.status = "done"
+                    self.log("SUCCESS", "Orchestrator", "✅ Код выполнен успешно")
                     break
                 else:
-                    self.log("Code Reviewer", f"❌ Код не одобрен: {review.get('issues', [])}", "WARN")
-                    review_report = review
-                    continue
+                    self.executor.status = "error"
+                    self.log("ERROR", "Orchestrator", f"❌ Ошибка выполнения: {exec_result.error}")
+                    
+                    # Отладка
+                    if iteration < self.max_iterations:
+                        self.log("INFO", "Orchestrator", "🐛 Запуск отладчика")
+                        self.debugger.status = "working"
+                        debug_result = await self.debugger.execute(exec_result.error, self.code)
+                        
+                        if debug_result.success and isinstance(debug_result.data, str):
+                            self.code = debug_result.data
+                            self.debugger.status = "done"
+                            self.log("SUCCESS", "Orchestrator", "✅ Отладчик предложил исправление")
+                        else:
+                            self.debugger.status = "error"
+                            self.log("WARN", "Orchestrator", "⚠️ Отладчик не смог исправить")
+                    else:
+                        self.log("ERROR", "Orchestrator", "❌ Превышен лимит итераций")
+                        return {
+                            "success": False,
+                            "error": "Превышен лимит итераций",
+                            "spec": self.spec,
+                            "code": self.code,
+                        }
             
-            # Проверка на превышение лимита итераций
-            if not tests.get("passed", False) or not review.get("approved", False):
-                self.log("Orchestrator", "⚠️ Превышен лимит итераций", "WARN")
+            # Фаза 5: Валидация модели
+            self.log("INFO", "Orchestrator", "✅ Фаза 5: Валидатор проверяет модель")
+            self.validator.status = "working"
+            valid_result = await self.validator.execute(self.spec)
+            
+            if not valid_result.success:
+                self.validator.status = "error"
+                self.log("ERROR", "Orchestrator", f"❌ Валидация не пройдена: {valid_result.error}")
                 return {
                     "success": False,
-                    "artifacts": self.artifacts,
-                    "error": "Превышен лимит итераций"
+                    "error": "Валидация не пройдена",
+                    "spec": self.spec,
+                    "code": self.code,
                 }
             
-            # Фаза 6: Упаковка
-            self.log("Orchestrator", "🚀 Фаза 6: Упаковка")
-            docker_config = await self.devops.package(code, requirements, architecture)
-            self.artifacts["Dockerfile"] = docker_config.get("Dockerfile", "")
-            self.artifacts["docker-compose.yml"] = docker_config.get("docker-compose.yml", "")
-            self.artifacts["ci.yml"] = docker_config.get("ci.yml", "")
-            self.log("DevOps Engineer", "✅ Упаковка завершена")
+            self.validator.status = "done"
+            self.log("SUCCESS", "Orchestrator", "✅ Модель валидна")
             
-            self.log("Orchestrator", "✨ Задача успешно завершена!")
+            # Фаза 6: Сохранение
+            self.log("INFO", "Orchestrator", f"💾 Фаза 6: Сохранение модели в {self.output_path}")
+            save_success, save_error = self.ps.save_model(self.output_path)
+            
+            if save_success:
+                self.log("SUCCESS", "Orchestrator", f"✅ Модель сохранена: {self.output_path}")
+            else:
+                self.log("ERROR", "Orchestrator", f"❌ Ошибка сохранения: {save_error}")
+                return {
+                    "success": False,
+                    "error": f"Ошибка сохранения: {save_error}",
+                    "spec": self.spec,
+                    "code": self.code,
+                }
+            
+            elapsed = time.time() - start_time
+            self.log("SUCCESS", "Orchestrator", f"✨ Модель построена за {elapsed:.1f} сек")
             
             return {
                 "success": True,
-                "artifacts": self.artifacts,
-                "iterations": self.current_iteration
+                "spec": self.spec,
+                "code": self.code,
+                "iterations": self.iteration,
+                "elapsed": elapsed,
             }
             
         except Exception as e:
-            self.log("Orchestrator", f"❌ Критическая ошибка: {str(e)}", "ERROR")
+            self.log("ERROR", "Orchestrator", f"❌ Критическая ошибка: {str(e)}")
+            import traceback
+            self.log("ERROR", "Orchestrator", traceback.format_exc())
             return {
                 "success": False,
-                "artifacts": self.artifacts,
-                "error": str(e)
+                "error": str(e),
+                "spec": self.spec,
+                "code": self.code,
             }
+    
+    async def run_research(self, task: str = "full") -> dict:
+        """Запускает исследование API Plant Simulation"""
+        self.log("INFO", "Orchestrator", f"🔬 Запуск исследования: {task}")
+        
+        self.ps.check_connection()
+        self.researcher.status = "working"
+        result = await self.researcher.execute(task)
+        
+        if result.success:
+            self.researcher.status = "done"
+            self.log("SUCCESS", "Orchestrator", "✅ Исследование завершено")
+        else:
+            self.researcher.status = "error"
+            self.log("ERROR", "Orchestrator", f"❌ Ошибка исследования: {result.error}")
+        
+        return {
+            "success": result.success,
+            "data": result.data,
+            "error": result.error,
+        }
