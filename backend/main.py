@@ -24,9 +24,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from backend.plant_sim import PlantSimConnection
-from backend.parallel_agents import SupervisorAgent, AgentStatus
-from backend.knowledge_base import kb
+from plant_sim import PlantSimConnection
+from parallel_agents import SupervisorAgent, AgentStatus
+from knowledge_base import kb
 
 # ─── Global State ─────────────────────────────────────────────────────
 
