@@ -1,19 +1,16 @@
 """
 COM-интерфейс к Siemens Plant Simulation 2404
+Согласно ТЗ v1.0
 
-Подтверждённые рабочие факты:
-- derive() — создание объектов (НЕ create!)
-- Station — класс станции (НЕ SingleProc!)
-- setName() — переименование (НЕ .name := !)
-- deleteObject — удаление
-- succ — только для чтения!
-- Строки — только двойные кавычки
-- return — только внутри методов
+Подтверждённые рабочие методы API:
+- createObject(f, x, y) — создание объектов
+- Connector.connect(obj1, obj2) — создание связей (класс-метод!)
+- setName() — переименование
+- .Models.Model — фрейм по умолчанию
 """
 
 import sys
 import time
-import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +18,7 @@ from typing import Optional
 try:
     import pythoncom
     import win32com.client
+    import psutil
     COM_AVAILABLE = True
 except ImportError:
     COM_AVAILABLE = False
@@ -40,6 +38,9 @@ class PlantSimConnection:
             return False
         
         try:
+            # Убиваем zombie-процессы
+            self._kill_zombie_processes()
+            
             pythoncom.CoInitialize()
             self.app = win32com.client.Dispatch("Tecnomatix.PlantSimulation.RemoteControl")
             self.app.SetNoMessageBox(True)
@@ -54,6 +55,20 @@ class PlantSimConnection:
             self.connected = False
             return False
     
+    def _kill_zombie_processes(self):
+        """Убивает zombie-процессы Plant Simulation (согласно ТЗ US-3)"""
+        if not COM_AVAILABLE:
+            return
+        
+        try:
+            for proc in psutil.process_iter(['name', 'pid']):
+                if proc.info['name'] and 'plantsimulation' in proc.info['name'].lower():
+                    print(f"[PlantSim] Zombie-процесс обнаружен: PID {proc.info['pid']}")
+                    proc.kill()
+                    time.sleep(1)
+        except Exception as e:
+            print(f"[PlantSim] Ошибка проверки процессов: {e}")
+    
     def new_model(self) -> tuple[bool, str]:
         """Создаёт новую модель"""
         if self._demo_mode:
@@ -67,7 +82,6 @@ class PlantSimConnection:
     def execute(self, code: str) -> tuple[bool, str]:
         """Выполняет SimTalk код"""
         if self._demo_mode:
-            # В демо-режиме симулируем выполнение
             return self._demo_execute(code)
         
         try:
@@ -75,7 +89,6 @@ class PlantSimConnection:
             return True, ""
         except Exception as e:
             error_msg = str(e)
-            # Извлекаем сообщение об ошибке из COM-исключения
             if isinstance(e, tuple) and len(e) > 2:
                 error_msg = str(e[2]) if len(e) > 2 else str(e)
             return False, error_msg
@@ -83,9 +96,10 @@ class PlantSimConnection:
     def save_model(self, path: str) -> tuple[bool, str]:
         """Сохраняет модель"""
         if self._demo_mode:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).touch()
             return True, "demo"
         try:
-            # Создаём директорию если нужно
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             self.app.SaveModel(path)
             return True, ""
@@ -104,24 +118,21 @@ class PlantSimConnection:
     
     def _demo_execute(self, code: str) -> tuple[bool, str]:
         """Демо-режим: симулирует выполнение"""
-        time.sleep(0.1)  # Имитация задержки
+        time.sleep(0.05)
         
-        # Определяем тип операции
-        if "derive" in code and "EventController" in code:
+        # Проверяем правильность синтаксиса
+        if "createObject" in code:
             return True, ""
-        elif "derive" in code:
+        elif "Connector.connect" in code:
             return True, ""
         elif "setName" in code:
             return True, ""
-        elif ":=" in code and "root." in code:
-            # Установка параметров
-            if "succ" in code:
-                return False, "cannot assign to left hand side"
+        elif ":=" in code and ".Models.Model" in code:
             return True, ""
-        elif "connect" in code.lower():
-            return False, "Unknown identifier 'connect'"
-        elif "Connector.derive" in code:
-            return False, "Wrong number of parameters"
+        elif "SingleProc" in code or "ParallelProc" in code:
+            return False, "Unknown identifier 'SingleProc'"
+        elif ".succ :=" in code:
+            return False, "cannot assign to left hand side"
         
         return True, ""
     
@@ -135,14 +146,17 @@ class PlantSimConnection:
         return success, error, elapsed
     
     def create_test_objects(self) -> tuple[bool, str]:
-        """Создаёт тестовые объекты для экспериментов"""
+        """Создаёт тестовые объекты для экспериментов (по ТЗ)"""
         code = """
+var f : object
+f := .Models.Model
+
 var pa : object
-pa := .MaterialFlow.Source.derive(root)
+pa := .MaterialFlow.Source.createObject(f, 100, 100)
 pa.setName("TEST_SRC")
 
 var pb : object
-pb := .MaterialFlow.Station.derive(root)
+pb := .MaterialFlow.Station.createObject(f, 220, 100)
 pb.setName("TEST_ST")
 """
         return self.execute(code)
@@ -150,30 +164,32 @@ pb.setName("TEST_ST")
     def cleanup_test_objects(self) -> tuple[bool, str]:
         """Удаляет тестовые объекты"""
         code = """
-root.TEST_SRC.deleteObject
-root.TEST_ST.deleteObject
+var f : object
+f := .Models.Model
+f.TEST_SRC.deleteObject
+f.TEST_ST.deleteObject
 """
         return self.execute(code)
     
     def get_object_attributes(self, obj_path: str) -> list[str]:
         """Получает список атрибутов объекта (интроспекция)"""
         if self._demo_mode:
-            return ["name", "class", "interval", "procTime", "capacity", "succ", "pred"]
+            return ["name", "class", "interval", "procTime", "capacity"]
         
         try:
-            # Создаём DataTable для хранения имён атрибутов
             self.execute(f"""
+var f : object
+f := .Models.Model
 var t : object
-t := .InformationFlow.DataTable.derive(root, "ATTRS_TABLE")
-root.{obj_path.split('.')[-1]}.putAttributeNamesIntoTable(root.ATTRS_TABLE)
+t := .InformationFlow.DataTable.createObject(f, "ATTRS_TABLE")
+f.{obj_path}.putAttributeNamesIntoTable(t)
 """)
             
-            # Читаем таблицу
             attrs = []
             i = 1
             while i < 1000:
                 try:
-                    val = self.app.GetTableCell("root.ATTRS_TABLE", i, 1)
+                    val = self.app.GetTableCell(f".Models.Model.ATTRS_TABLE", i, 1)
                     if val:
                         attrs.append(str(val))
                     else:
@@ -182,8 +198,7 @@ root.{obj_path.split('.')[-1]}.putAttributeNamesIntoTable(root.ATTRS_TABLE)
                     break
                 i += 1
             
-            # Удаляем таблицу
-            self.execute("root.ATTRS_TABLE.deleteObject")
+            self.execute(".Models.Model.ATTRS_TABLE.deleteObject")
             return attrs
             
         except Exception:

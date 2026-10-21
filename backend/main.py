@@ -1,19 +1,23 @@
 """
-PS AI Agent — Backend Server
+PS AI Agent — Backend Server (согласно ТЗ)
 Автономная система ИИ-агентов для Plant Simulation 2404
 
 Запуск: python backend/main.py
-API: http://localhost:8000
+API: http://localhost:7860
 """
 
 import asyncio
 import json
 import time
 import traceback
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# Добавляем корневую директорию в path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,10 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from agents import AgentSwarm
-from researcher import APIResearcher
-from plant_sim import PlantSimConnection
-from ollama_client import OllamaClient
+from plant_agent_full import Orchestrator, Architect, Builder, Executor, Config
 
 # ─── Global State ─────────────────────────────────────────────────────
 
@@ -33,11 +34,10 @@ class AppState:
         self.state: str = "idle"
         self.logs: list[dict] = []
         self.log_id: int = 0
+        self.spec: Optional[dict] = None
+        self.code: str = ""
         self.objects: list[dict] = []
-        self.research: list[dict] = []
         self.current_task: Optional[asyncio.Task] = None
-        self.swarm: Optional[AgentSwarm] = None
-        self.researcher: Optional[APIResearcher] = None
 
 state = AppState()
 
@@ -53,23 +53,26 @@ def add_log(level: str, agent: str, msg: str):
         "msg": msg,
     }
     state.logs.append(entry)
-    # Keep last 1000 logs
-    if len(state.logs) > 1000:
-        state.logs = state.logs[-1000:]
+    if len(state.logs) > 2000:
+        state.logs = state.logs[-2000:]
     print(f"[{entry['time']}] [{level}] [{agent}] {msg}")
 
 # ─── API Models ───────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):
     description: str
-    auto_research: bool = True
+    output_path: str = "model.spp"
+
+class DryRunRequest(BaseModel):
+    description: str
 
 # ─── Lifespan ─────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     add_log("INFO", "SYSTEM", "PS AI Agent Backend запущен")
-    add_log("INFO", "SYSTEM", f"API: http://localhost:8000")
+    add_log("INFO", "SYSTEM", "API: http://localhost:7860")
+    add_log("INFO", "SYSTEM", "Согласно ТЗ v1.0 — Plant Simulation 2404")
     yield
     add_log("INFO", "SYSTEM", "Backend остановлен")
 
@@ -89,19 +92,16 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    """Проверка статуса всех систем"""
+    """Проверка статуса"""
+    executor = Executor()
+    ps_ok = executor.connect()
+    
     ollama_ok = False
-    ps_ok = False
-    
     try:
-        client = OllamaClient()
-        ollama_ok = await client.check_health()
-    except Exception:
-        pass
-    
-    try:
-        conn = PlantSimConnection()
-        ps_ok = conn.check_connection()
+        import httpx
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{Config.OLLAMA_URL}/api/tags")
+            ollama_ok = r.status_code == 200
     except Exception:
         pass
     
@@ -113,150 +113,221 @@ async def health():
 
 @app.get("/logs")
 async def get_logs(after: int = 0):
-    """Получить логи после указанного ID"""
     return [log for log in state.logs if log["id"] > after]
 
 @app.get("/status")
 async def get_status():
-    """Получить текущий статус системы"""
     return {
         "state": state.state,
+        "spec": state.spec,
+        "code": state.code,
         "objects": state.objects,
-        "research": state.research,
     }
 
 @app.post("/run")
 async def run_agent(req: RunRequest):
-    """Запустить агента для построения модели"""
+    """Запустить полный цикл создания модели"""
     if state.current_task and not state.current_task.done():
         return {"error": "Уже выполняется задача"}
     
     state.state = "connecting"
     state.objects = []
+    state.spec = None
+    state.code = ""
     
     async def task():
         try:
-            swarm = AgentSwarm(add_log)
-            state.swarm = swarm
+            orchestrator = Orchestrator()
             
-            # Phase 1: Подключение
-            add_log("INFO", "SYSTEM", "Подключение к Ollama...")
-            state.state = "connecting"
-            ollama = OllamaClient()
-            if not await ollama.check_health():
-                add_log("WARN", "SYSTEM", "Ollama недоступна — используется fallback-парсер")
-            
+            # Шаг 1: Подключение
             add_log("INFO", "SYSTEM", "Подключение к Plant Simulation...")
-            ps = PlantSimConnection()
-            if not ps.check_connection():
-                add_log("WARN", "SYSTEM", "Plant Simulation не запущен — демо-режим")
+            state.state = "connecting"
+            await asyncio.sleep(0.3)
             
-            # Phase 2: Парсинг описания
+            connected = orchestrator.executor.connect()
+            if connected:
+                add_log("SUCCESS", "SYSTEM", "Plant Simulation подключен")
+            else:
+                add_log("WARN", "SYSTEM", "Plant Simulation недоступен — демо-режим")
+            
+            # Шаг 2: Парсинг
             add_log("INFO", "ARCHITECT", f"Анализ описания: '{req.description[:80]}...'")
             state.state = "parsing"
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
             
-            specification = await swarm.architect.parse(req.description, ollama)
-            add_log("SUCCESS", "ARCHITECT", f"Найдено {len(specification['objects'])} объектов, {len(specification['connections'])} соединений")
+            spec = orchestrator.architect.parse(req.description)
+            state.spec = spec
+            add_log("SUCCESS", "ARCHITECT", f"Найдено {len(spec['objects'])} объектов, {len(spec['connections'])} соединений")
             
-            # Phase 3: Генерация кода
+            # Обновляем объекты для UI
+            state.objects = []
+            for obj in spec["objects"]:
+                state.objects.append({
+                    "name": obj["name"],
+                    "class": obj["class"],
+                    "x": obj.get("x", 0),
+                    "y": obj.get("y", 0),
+                    "params": obj.get("params", {}),
+                })
+            
+            # Шаг 3: Генерация кода
             add_log("INFO", "BUILDER", "Генерация SimTalk кода...")
             state.state = "building"
             await asyncio.sleep(0.3)
             
-            code_blocks = swarm.builder.generate(specification)
-            add_log("SUCCESS", "BUILDER", f"Сгенерировано {len(code_blocks)} блоков кода")
+            code = orchestrator.builder.generate(spec)
+            state.code = code
+            add_log("SUCCESS", "BUILDER", f"Сгенерировано {len(code.splitlines())} строк SimTalk")
             
-            # Phase 4: Выполнение
-            add_log("INFO", "EXECUTOR", "Создание модели в Plant Simulation...")
+            # Шаг 4: Выполнение
+            add_log("INFO", "EXECUTOR", "Выполнение кода в Plant Simulation...")
             state.state = "executing"
+            await asyncio.sleep(0.3)
             
-            results = await swarm.executor.execute(code_blocks, ps)
+            orchestrator.executor.new_model()
+            success, error = orchestrator.executor.execute(code)
             
-            # Обновляем объекты
-            state.objects = []
-            for obj in specification["objects"]:
-                state.objects.append({
-                    "name": obj["name"],
-                    "class": obj["class"],
-                    "params": obj.get("params", {}),
-                    "x": 0,
-                    "y": 0,
-                    "connected": False,
-                })
-            
-            # Проверяем соединения
-            connection_results = results.get("connections", [])
-            for i, conn_result in enumerate(connection_results):
-                if i < len(state.objects) - 1:
-                    state.objects[i]["connected"] = conn_result.get("success", False)
-            
-            if results.get("all_connected"):
-                add_log("SUCCESS", "EXECUTOR", "Все соединения созданы!")
+            if success:
+                add_log("SUCCESS", "EXECUTOR", "Код выполнен успешно")
             else:
-                failed = [r for r in connection_results if not r.get("success")]
-                if failed and req.auto_research:
-                    add_log("WARN", "EXECUTOR", f"{len(failed)} соединений не создано")
-                    add_log("INFO", "RESEARCHER", "Запуск авто-исследования методов соединений...")
-                    state.state = "researching"
-                    
-                    researcher = APIResearcher(add_log, ps)
-                    state.researcher = researcher
-                    found = await researcher.find_connection_method()
-                    state.research = researcher.results
-                    
-                    if found:
-                        add_log("SUCCESS", "RESEARCHER", f"Найден рабочий метод: {found['method']}")
-                        # Пробуем применить найденный метод
-                        retry_results = await swarm.executor.retry_connections(found, ps)
-                        for i, r in enumerate(retry_results):
-                            if r.get("success") and i < len(state.objects) - 1:
-                                state.objects[i]["connected"] = True
+                add_log("ERROR", "EXECUTOR", f"Ошибка: {error}")
+                
+                # Healing attempts
+                for attempt in range(1, Config.MAX_HEALING_ATTEMPTS):
+                    add_log("WARN", "DEBUGGER", f"Попытка автоисправления {attempt}/{Config.MAX_HEALING_ATTEMPTS}")
+                    await asyncio.sleep(1)
+                    orchestrator.executor.new_model()
+                    success, error = orchestrator.executor.execute(code)
+                    if success:
+                        add_log("SUCCESS", "DEBUGGER", "Автоисправление успешно")
+                        break
                     else:
-                        add_log("WARN", "RESEARCHER", "Рабочий метод соединений не найден")
+                        add_log("ERROR", "DEBUGGER", f"Ошибка: {error}")
             
-            # Phase 5: Сохранение
-            add_log("INFO", "EXECUTOR", "Сохранение модели...")
-            saved = await swarm.validator.save(ps)
+            # Шаг 5: Валидация
+            add_log("INFO", "VALIDATOR", "Валидация модели...")
+            valid = orchestrator.validator.validate(spec)
+            if valid:
+                add_log("SUCCESS", "VALIDATOR", "Валидация пройдена")
+            else:
+                add_log("ERROR", "VALIDATOR", "Валидация не пройдена")
+            
+            # Шаг 6: Сохранение
+            add_log("INFO", "EXECUTOR", f"Сохранение модели: {req.output_path}")
+            saved = orchestrator.executor.save_model(req.output_path)
             if saved:
-                add_log("SUCCESS", "EXECUTOR", "Модель сохранена!")
+                add_log("SUCCESS", "EXECUTOR", f"Модель сохранена: {req.output_path}")
             
             state.state = "done"
-            add_log("SUCCESS", "SYSTEM", "Задача завершена!")
+            add_log("SUCCESS", "SYSTEM", "✅ Задача завершена!")
             
         except Exception as e:
-            add_log("ERROR", "SYSTEM", f"Ошибка: {str(e)}")
+            add_log("ERROR", "SYSTEM", f"Критическая ошибка: {str(e)}")
             add_log("ERROR", "SYSTEM", traceback.format_exc())
             state.state = "error"
     
     state.current_task = asyncio.create_task(task())
     return {"status": "started"}
 
-@app.post("/research")
-async def run_research():
-    """Запустить авто-исследование API"""
+@app.post("/dry-run")
+async def dry_run(req: DryRunRequest):
+    """Тестовый запуск без COM"""
+    try:
+        architect = Architect()
+        builder = Builder()
+        
+        spec = architect.parse(req.description)
+        code = builder.generate(spec)
+        
+        return {
+            "spec": spec,
+            "code": code,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/selftest")
+async def selftest():
+    """Самотестирование"""
     if state.current_task and not state.current_task.done():
         return {"error": "Уже выполняется задача"}
     
-    state.state = "researching"
-    state.research = []
+    state.state = "testing"
+    state.logs = []
+    state.log_id = 0
     
     async def task():
         try:
-            add_log("INFO", "RESEARCHER", "Запуск авто-исследования API Plant Simulation")
+            add_log("INFO", "SYSTEM", "=== САМОТЕСТИРОВАНИЕ ===")
             
-            ps = PlantSimConnection()
-            researcher = APIResearcher(add_log, ps)
-            state.researcher = researcher
+            # Тест 1: COM подключение
+            add_log("INFO", "TEST", "Тест 1: Подключение к Plant Simulation...")
+            executor = Executor()
+            connected = executor.connect()
+            if connected:
+                add_log("SUCCESS", "TEST", "✅ Plant Simulation подключен")
+            else:
+                add_log("WARN", "TEST", "⚠️ Plant Simulation недоступен (демо-режим)")
             
-            await researcher.full_research()
-            state.research = researcher.results
+            await asyncio.sleep(0.3)
             
+            # Тест 2: createObject
+            add_log("INFO", "TEST", "Тест 2: Проверка createObject...")
+            test_code = f"""
+var f : object
+f := {Config.DEFAULT_FRAME}
+var test_obj : object
+test_obj := .MaterialFlow.Source.createObject(f, 100, 100)
+test_obj.setName("TEST_OBJ")
+"""
+            success, error = executor.execute(test_code)
+            if success:
+                add_log("SUCCESS", "TEST", "✅ createObject работает")
+            else:
+                add_log("ERROR", "TEST", f"❌ createObject: {error}")
+            
+            await asyncio.sleep(0.3)
+            
+            # Тест 3: Connector.connect
+            add_log("INFO", "TEST", "Тест 3: Проверка Connector.connect...")
+            conn_code = f"""
+var f : object
+f := {Config.DEFAULT_FRAME}
+var obj1 : object
+obj1 := .MaterialFlow.Source.createObject(f, 200, 100)
+obj1.setName("TEST_SRC")
+var obj2 : object
+obj2 := .MaterialFlow.Station.createObject(f, 320, 100)
+obj2.setName("TEST_ST")
+.MaterialFlow.Connector.connect(obj1, obj2)
+"""
+            success, error = executor.execute(conn_code)
+            if success:
+                add_log("SUCCESS", "TEST", "✅ Connector.connect работает")
+            else:
+                add_log("ERROR", "TEST", f"❌ Connector.connect: {error}")
+            
+            await asyncio.sleep(0.3)
+            
+            # Тест 4: Устаревшие методы
+            add_log("INFO", "TEST", "Тест 4: Проверка устаревших методов...")
+            old_code = f"""
+var f : object
+f := {Config.DEFAULT_FRAME}
+var old_obj : object
+old_obj := .MaterialFlow.SingleProc.createObject(f, 400, 100)
+"""
+            success, error = executor.execute(old_code)
+            if not success:
+                add_log("SUCCESS", "TEST", "✅ SingleProc корректно не работает")
+            else:
+                add_log("WARN", "TEST", "⚠️ SingleProc работает (неожиданно)")
+            
+            add_log("INFO", "SYSTEM", "=== САМОТЕСТИРОВАНИЕ ЗАВЕРШЕНО ===")
             state.state = "done"
-            add_log("SUCCESS", "RESEARCHER", f"Исследование завершено. Проверено {len(researcher.results)} методов.")
             
         except Exception as e:
-            add_log("ERROR", "RESEARCHER", f"Ошибка исследования: {str(e)}")
+            add_log("ERROR", "TEST", f"Ошибка тестирования: {e}")
             state.state = "error"
     
     state.current_task = asyncio.create_task(task())
@@ -264,11 +335,10 @@ async def run_research():
 
 @app.post("/stop")
 async def stop():
-    """Остановить текущую задачу"""
     if state.current_task and not state.current_task.done():
         state.current_task.cancel()
         state.state = "idle"
-        add_log("WARN", "SYSTEM", "Задача остановлена пользователем")
+        add_log("WARN", "SYSTEM", "Задача остановлена")
     return {"status": "stopped"}
 
 # ─── Serve Frontend ───────────────────────────────────────────────────
@@ -290,8 +360,8 @@ if DIST_DIR.exists():
 if __name__ == "__main__":
     import uvicorn
     print("=" * 60)
-    print("  PS AI Agent — Backend Server")
-    print("  API: http://localhost:8000")
-    print("  Frontend: http://localhost:8000 (после npm run build)")
+    print("  PS AI Agent — Backend Server (ТЗ v1.0)")
+    print("  API: http://localhost:7860")
+    print("  Plant Simulation 2404")
     print("=" * 60)
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=7860)
