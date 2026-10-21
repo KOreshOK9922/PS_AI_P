@@ -10,47 +10,58 @@ interface LogEntry {
   msg: string
 }
 
-interface AgentStatus {
-  name: string
-  icon: string
-  status: 'idle' | 'working' | 'done' | 'error'
-  detail: string
-}
-
 interface ModelObject {
   name: string
   class: string
-  params: Record<string, number>
   x: number
   y: number
-  connected: boolean
+  params: Record<string, number>
 }
 
-interface ResearchResult {
-  method: string
-  code: string
-  success: boolean
-  error?: string
-  time: number
+interface Spec {
+  objects: ModelObject[]
+  connections: string[][]
 }
 
-type AppState = 'idle' | 'connecting' | 'parsing' | 'building' | 'executing' | 'researching' | 'done' | 'error'
+interface AgentStatus {
+  name: string
+  status: 'idle' | 'working' | 'done' | 'error' | 'waiting'
+}
 
-const API_BASE = 'http://localhost:8000'
+interface KnowledgeMethod {
+  name: string
+  template: string
+  success_rate: number
+  attempts: number
+  successes: number
+  notes: string
+}
+
+interface KnowledgeClass {
+  name: string
+  create_method: string
+  params: string | null
+  notes: string
+  verified: boolean
+}
+
+type AppState = 'idle' | 'initializing' | 'connecting' | 'parsing' | 'building' | 'executing' | 'researching' | 'testing' | 'done' | 'error'
+
+const API_BASE = 'http://localhost:7860'
 
 // ─── Main App ────────────────────────────────────────────────────────
 export default function App() {
   const [description, setDescription] = useState('')
   const [appState, setAppState] = useState<AppState>('idle')
   const [logs, setLogs] = useState<LogEntry[]>([])
-  const [agents, setAgents] = useState<AgentStatus[]>(getDefaultAgents())
-  const [modelObjects, setModelObjects] = useState<ModelObject[]>([])
-  const [researchResults, setResearchResults] = useState<ResearchResult[]>([])
+  const [spec, setSpec] = useState<Spec | null>(null)
+  const [code, setCode] = useState('')
+  const [agents, setAgents] = useState<Record<string, string>>({})
   const [backendOnline, setBackendOnline] = useState(false)
-  const [ollamaOnline, setOllamaOnline] = useState(false)
   const [psOnline, setPsOnline] = useState(false)
-  const [activeTab, setActiveTab] = useState<'control' | 'model' | 'research' | 'logs'>('control')
-  const [autoResearch, setAutoResearch] = useState(true)
+  const [psMethod, setPsMethod] = useState<string>('')
+  const [activeTab, setActiveTab] = useState<'control' | 'agents' | 'spec' | 'code' | 'model' | 'knowledge' | 'logs'>('control')
+  const [parallelResearch, setParallelResearch] = useState(false)
   const logEndRef = useRef<HTMLDivElement>(null!)
   const logIdRef = useRef(0)
   const pollRef = useRef<ReturnType<typeof setInterval>>()
@@ -62,12 +73,12 @@ export default function App() {
         const r = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(2000) })
         const d = await r.json()
         setBackendOnline(true)
-        setOllamaOnline(d.ollama ?? false)
         setPsOnline(d.plant_simulation ?? false)
+        setPsMethod(d.connection_method ?? '')
       } catch {
         setBackendOnline(false)
-        setOllamaOnline(false)
         setPsOnline(false)
+        setPsMethod('')
       }
     }
     check()
@@ -83,15 +94,6 @@ export default function App() {
       if (data.length > 0) {
         logIdRef.current = data[data.length - 1].id
         setLogs(prev => [...prev, ...data])
-        
-        // Update agents from log
-        data.forEach(entry => {
-          if (entry.agent === 'ARCHITECT') setAgents(prev => prev.map(a => a.name === 'Архитектор' ? { ...a, status: 'working', detail: entry.msg } : a))
-          if (entry.agent === 'BUILDER') setAgents(prev => prev.map(a => a.name === 'Строитель' ? { ...a, status: 'working', detail: entry.msg } : a))
-          if (entry.agent === 'EXECUTOR') setAgents(prev => prev.map(a => a.name === 'Исполнитель' ? { ...a, status: 'working', detail: entry.msg } : a))
-          if (entry.agent === 'DEBUGGER') setAgents(prev => prev.map(a => a.name === 'Отладчик' ? { ...a, status: 'working', detail: entry.msg } : a))
-          if (entry.agent === 'RESEARCHER') setAgents(prev => prev.map(a => a.name === 'Исследователь' ? { ...a, status: 'working', detail: entry.msg } : a))
-        })
       }
     } catch { /* ignore */ }
   }, [])
@@ -110,24 +112,25 @@ export default function App() {
   // ─── Actions ──────────────────────────────────────────────────────
   const startAgent = async () => {
     if (!description.trim()) return
-    setAppState('connecting')
+    setAppState('initializing')
     setLogs([])
-    setModelObjects([])
-    setResearchResults([])
-    setAgents(getDefaultAgents())
+    setSpec(null)
+    setCode('')
+    setAgents({})
     logIdRef.current = 0
-
-    addLocalLog('INFO', 'SYSTEM', 'Запуск автономной системы...')
 
     try {
       const r = await fetch(`${API_BASE}/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ description, auto_research: autoResearch }),
+        body: JSON.stringify({ 
+          description, 
+          output_path: 'model.spp',
+          parallel_research: parallelResearch 
+        }),
       })
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       
-      // Start polling
       setAppState('parsing')
       pollRef.current = setInterval(async () => {
         await pollLogs()
@@ -136,7 +139,6 @@ export default function App() {
           const sd = await sr.json()
           if (sd.state === 'done') {
             setAppState('done')
-            setAgents(prev => prev.map(a => ({ ...a, status: 'done' as const })))
             if (pollRef.current) clearInterval(pollRef.current)
           } else if (sd.state === 'error') {
             setAppState('error')
@@ -144,43 +146,77 @@ export default function App() {
           } else {
             setAppState(sd.state as AppState)
           }
-          if (sd.objects) setModelObjects(sd.objects)
-          if (sd.research) setResearchResults(sd.research)
+          if (sd.spec) setSpec(sd.spec)
+          if (sd.code) setCode(sd.code)
+          if (sd.agents) setAgents(sd.agents)
         } catch { /* ignore */ }
       }, 500)
     } catch (err: any) {
-      addLocalLog('ERROR', 'SYSTEM', `Не удалось подключиться к бэкенду: ${err.message}`)
-      addLocalLog('INFO', 'SYSTEM', 'Убедитесь что запущен: python backend/main.py')
+      setLogs([{
+        id: ++logIdRef.current,
+        time: new Date().toLocaleTimeString('ru-RU'),
+        level: 'ERROR',
+        agent: 'SYSTEM',
+        msg: `Не удалось подключиться: ${err.message}`,
+      }])
       setAppState('error')
     }
   }
 
-  const startResearch = async () => {
+  const runResearch = async (task: string = 'full') => {
     setAppState('researching')
     setLogs([])
-    setResearchResults([])
     logIdRef.current = 0
-    addLocalLog('INFO', 'RESEARCHER', 'Запуск авто-исследования API Plant Simulation...')
 
     try {
-      await fetch(`${API_BASE}/research`, { method: 'POST' })
-      setAgents(prev => prev.map(a => a.name === 'Исследователь' ? { ...a, status: 'working', detail: 'Исследует API...' } : a))
+      await fetch(`${API_BASE}/research`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task }),
+      })
       
       pollRef.current = setInterval(async () => {
         await pollLogs()
         try {
           const sr = await fetch(`${API_BASE}/status`, { signal: AbortSignal.timeout(2000) })
           const sd = await sr.json()
-          if (sd.research) setResearchResults(sd.research)
           if (sd.state === 'done') {
             setAppState('done')
-            setAgents(prev => prev.map(a => a.name === 'Исследователь' ? { ...a, status: 'done', detail: 'Исследование завершено' } : a))
             if (pollRef.current) clearInterval(pollRef.current)
           }
         } catch { /* ignore */ }
       }, 500)
     } catch (err: any) {
-      addLocalLog('ERROR', 'SYSTEM', `Ошибка: ${err.message}`)
+      setLogs([{
+        id: ++logIdRef.current,
+        time: new Date().toLocaleTimeString('ru-RU'),
+        level: 'ERROR',
+        agent: 'SYSTEM',
+        msg: `Ошибка: ${err.message}`,
+      }])
+      setAppState('error')
+    }
+  }
+
+  const runSelfTest = async () => {
+    setAppState('testing')
+    setLogs([])
+    logIdRef.current = 0
+
+    try {
+      await fetch(`${API_BASE}/selftest`, { method: 'POST' })
+      pollRef.current = setInterval(async () => {
+        await pollLogs()
+        try {
+          const sr = await fetch(`${API_BASE}/status`, { signal: AbortSignal.timeout(2000) })
+          const sd = await sr.json()
+          if (sd.state === 'done') {
+            setAppState('done')
+            if (pollRef.current) clearInterval(pollRef.current)
+          }
+        } catch { /* ignore */ }
+      }, 500)
+    } catch (err: any) {
       setAppState('error')
     }
   }
@@ -188,20 +224,11 @@ export default function App() {
   const reset = () => {
     setAppState('idle')
     setLogs([])
-    setModelObjects([])
-    setResearchResults([])
-    setAgents(getDefaultAgents())
+    setSpec(null)
+    setCode('')
+    setAgents({})
     logIdRef.current = 0
     if (pollRef.current) clearInterval(pollRef.current)
-  }
-
-  const addLocalLog = (level: LogEntry['level'], agent: string, msg: string) => {
-    const entry: LogEntry = {
-      id: ++logIdRef.current,
-      time: new Date().toLocaleTimeString('ru-RU'),
-      level, agent, msg,
-    }
-    setLogs(prev => [...prev, entry])
   }
 
   return (
@@ -212,14 +239,18 @@ export default function App() {
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-lg">🏭</div>
             <div>
-              <h1 className="text-lg font-bold text-white leading-tight">PS AI Agent</h1>
-              <p className="text-[11px] text-gray-500">Автономная система • Plant Simulation 2404</p>
+              <h1 className="text-lg font-bold text-white leading-tight">PS AI Agent v2.0</h1>
+              <p className="text-[11px] text-gray-500">Параллельные агенты • База знаний • Plant Simulation 2404</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
             <StatusDot label="Backend" online={backendOnline} />
-            <StatusDot label="Ollama" online={ollamaOnline} />
             <StatusDot label="Plant Sim" online={psOnline} />
+            {psMethod && (
+              <div className="px-2 py-1 rounded-md bg-gray-800 text-[11px] text-gray-400">
+                {psMethod}
+              </div>
+            )}
           </div>
         </div>
       </header>
@@ -235,22 +266,20 @@ export default function App() {
               <textarea
                 value={description}
                 onChange={e => setDescription(e.target.value)}
-                placeholder="Источник заготовок с интервалом 3 минуты, станция обработки 20 секунд, накопитель на 10 мест, сход"
+                placeholder="Линия: источник заготовок с интервалом 3 минуты, станция обработки 20 секунд, накопитель на 10 мест, сход"
                 className="w-full h-32 bg-gray-950 border border-gray-700 rounded-lg p-3 text-sm text-gray-200 placeholder-gray-600 resize-none focus:outline-none focus:border-blue-600 transition-colors"
                 disabled={appState !== 'idle' && appState !== 'done' && appState !== 'error'}
               />
-              
-              <div className="flex items-center gap-2 mt-3">
-                <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={autoResearch}
-                    onChange={e => setAutoResearch(e.target.checked)}
-                    className="rounded bg-gray-800 border-gray-600"
-                  />
-                  Авто-исследование при ошибках
-                </label>
-              </div>
+
+              <label className="flex items-center gap-2 text-xs text-gray-400 mt-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={parallelResearch}
+                  onChange={e => setParallelResearch(e.target.checked)}
+                  className="rounded bg-gray-800 border-gray-600"
+                />
+                Параллельное исследование API
+              </label>
 
               <div className="flex gap-2 mt-3">
                 <button
@@ -258,41 +287,54 @@ export default function App() {
                   disabled={appState !== 'idle' && appState !== 'done' && appState !== 'error'}
                   className="flex-1 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 text-white font-medium text-sm transition-colors"
                 >
-                  {appState === 'idle' ? '▶ Запустить агента' : appState === 'done' ? '▶ Запустить снова' : '⏳ Работает...'}
+                  {appState === 'idle' ? '▶ Запустить' : appState === 'done' ? '▶ Запустить снова' : '⏳ Работает...'}
+                </button>
+              </div>
+
+              <div className="flex gap-2 mt-2">
+                <button
+                  onClick={() => runResearch('full')}
+                  disabled={appState !== 'idle' && appState !== 'done' && appState !== 'error'}
+                  className="flex-1 py-2 rounded-lg bg-purple-600/20 border border-purple-600/40 hover:bg-purple-600/30 disabled:bg-gray-800 disabled:border-gray-700 disabled:text-gray-600 text-purple-300 text-sm transition-colors"
+                >
+                  🔬 Исследовать
                 </button>
                 <button
-                  onClick={startResearch}
+                  onClick={runSelfTest}
                   disabled={appState !== 'idle' && appState !== 'done' && appState !== 'error'}
-                  className="px-4 py-2.5 rounded-lg bg-purple-600/20 border border-purple-600/40 hover:bg-purple-600/30 disabled:bg-gray-800 disabled:border-gray-700 disabled:text-gray-600 text-purple-300 text-sm transition-colors"
-                  title="Исследовать API Plant Simulation"
+                  className="flex-1 py-2 rounded-lg bg-amber-600/20 border border-amber-600/40 hover:bg-amber-600/30 disabled:bg-gray-800 disabled:border-gray-700 disabled:text-gray-600 text-amber-300 text-sm transition-colors"
                 >
-                  🔬
+                  🔧 Selftest
                 </button>
-                {(appState === 'done' || appState === 'error') && (
-                  <button
-                    onClick={reset}
-                    className="px-4 py-2.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm transition-colors"
-                  >
-                    ↺
-                  </button>
-                )}
               </div>
+
+              {(appState === 'done' || appState === 'error') && (
+                <button
+                  onClick={reset}
+                  className="w-full mt-2 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm transition-colors"
+                >
+                  ↺ Сброс
+                </button>
+              )}
             </div>
 
             {/* Agent Status */}
             <div className="rounded-xl bg-gray-900 border border-gray-800 p-4">
-              <h3 className="text-sm font-medium text-gray-300 mb-3">Агенты</h3>
+              <h3 className="text-sm font-medium text-gray-300 mb-3">Параллельные агенты</h3>
               <div className="space-y-2">
-                {agents.map(agent => (
-                  <div key={agent.name} className="flex items-center gap-3 p-2 rounded-lg bg-gray-800/50">
-                    <span className="text-lg">{agent.icon}</span>
-                    <div className="flex-1 min-w-0">
-                      <div className="text-xs font-medium text-gray-200">{agent.name}</div>
-                      <div className="text-[11px] text-gray-500 truncate">{agent.detail}</div>
+                {Object.entries(agents).length === 0 ? (
+                  <div className="text-xs text-gray-600 text-center py-4">Агенты не активны</div>
+                ) : (
+                  Object.entries(agents).map(([name, status]) => (
+                    <div key={name} className="flex items-center gap-3 p-2 rounded-lg bg-gray-800/50">
+                      <AgentIcon name={name} />
+                      <div className="flex-1">
+                        <div className="text-xs font-medium text-gray-200">{name}</div>
+                      </div>
+                      <AgentBadge status={status as any} />
                     </div>
-                    <AgentBadge status={agent.status} />
-                  </div>
-                ))}
+                  ))
+                )}
               </div>
             </div>
 
@@ -301,8 +343,8 @@ export default function App() {
               <h3 className="text-sm font-medium text-gray-300 mb-3">Примеры</h3>
               <div className="space-y-2">
                 {[
-                  'Источник 3 мин, станция 20 сек, буфер 10, сход',
-                  'Генератор каждые 60 секунд, две станции по 15 секунд, накопитель 5, выход',
+                  'Линия: источник заготовок с интервалом 3 минуты, станция обработки 20 секунд, накопитель на 10 мест, сход',
+                  'Источник каждые 60 секунд, две станции по 15 секунд, буфер 5, выход',
                   'Source interval 120, Station procTime 30, Buffer capacity 20, Drain',
                 ].map((ex, i) => (
                   <button
@@ -320,17 +362,20 @@ export default function App() {
           {/* ─── Right: Main Content ─── */}
           <div className="lg:col-span-2 space-y-4">
             {/* Tabs */}
-            <div className="flex gap-1 bg-gray-900 rounded-xl p-1 border border-gray-800">
+            <div className="flex gap-1 bg-gray-900 rounded-xl p-1 border border-gray-800 overflow-x-auto">
               {([
                 ['control', '📡 Управление'],
+                ['agents', '🤖 Агенты'],
+                ['spec', '📄 Спецификация'],
+                ['code', '💻 SimTalk'],
                 ['model', '🏗️ Модель'],
-                ['research', '🔬 Исследование'],
+                ['knowledge', '🧠 База знаний'],
                 ['logs', '📋 Логи'],
               ] as const).map(([id, label]) => (
                 <button
                   key={id}
                   onClick={() => setActiveTab(id)}
-                  className={`flex-1 py-2 rounded-lg text-sm font-medium transition-colors ${
+                  className={`flex-1 py-2 px-3 rounded-lg text-sm font-medium transition-colors whitespace-nowrap ${
                     activeTab === id ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'
                   }`}
                 >
@@ -348,22 +393,13 @@ export default function App() {
                 exit={{ opacity: 0, y: -10 }}
                 transition={{ duration: 0.15 }}
               >
-                {activeTab === 'control' && (
-                  <ControlPanel
-                    appState={appState}
-                    logs={logs}
-                    logEndRef={logEndRef}
-                  />
-                )}
-                {activeTab === 'model' && (
-                  <ModelView objects={modelObjects} />
-                )}
-                {activeTab === 'research' && (
-                  <ResearchView results={researchResults} />
-                )}
-                {activeTab === 'logs' && (
-                  <LogsView logs={logs} logEndRef={logEndRef} />
-                )}
+                {activeTab === 'control' && <ControlPanel appState={appState} logs={logs} logEndRef={logEndRef} />}
+                {activeTab === 'agents' && <AgentsView agents={agents} />}
+                {activeTab === 'spec' && <SpecView spec={spec} />}
+                {activeTab === 'code' && <CodeView code={code} />}
+                {activeTab === 'model' && <ModelView spec={spec} />}
+                {activeTab === 'knowledge' && <KnowledgeView />}
+                {activeTab === 'logs' && <LogsView logs={logs} logEndRef={logEndRef} />}
               </motion.div>
             </AnimatePresence>
           </div>
@@ -384,14 +420,28 @@ function StatusDot({ label, online }: { label: string; online: boolean }) {
   )
 }
 
-function AgentBadge({ status }: { status: AgentStatus['status'] }) {
-  const config = {
+function AgentIcon({ name }: { name: string }) {
+  const icons: Record<string, string> = {
+    Architect: '🏗️',
+    Builder: '🔨',
+    Executor: '⚡',
+    Debugger: '🐛',
+    Researcher: '🔬',
+    Validator: '✅',
+    Supervisor: '👑',
+  }
+  return <span className="text-lg">{icons[name] || '🤖'}</span>
+}
+
+function AgentBadge({ status }: { status: string }) {
+  const config: Record<string, { color: string; label: string }> = {
     idle: { color: 'bg-gray-600', label: 'Ожидание' },
     working: { color: 'bg-blue-500 animate-pulse', label: 'Работа' },
     done: { color: 'bg-green-500', label: 'Готово' },
     error: { color: 'bg-red-500', label: 'Ошибка' },
+    waiting: { color: 'bg-yellow-500', label: 'Ожидание' },
   }
-  const c = config[status]
+  const c = config[status] || config.idle
   return (
     <div className="flex items-center gap-1">
       <div className={`w-1.5 h-1.5 rounded-full ${c.color}`} />
@@ -405,39 +455,25 @@ function ControlPanel({ appState, logs, logEndRef }: {
 }) {
   const stateInfo: Record<AppState, { icon: string; label: string; color: string }> = {
     idle: { icon: '💤', label: 'Ожидание запуска', color: 'text-gray-400' },
-    connecting: { icon: '🔌', label: 'Подключение к системам...', color: 'text-blue-400' },
+    initializing: { icon: '🚀', label: 'Инициализация системы...', color: 'text-blue-400' },
+    connecting: { icon: '🔌', label: 'Подключение к Plant Simulation...', color: 'text-blue-400' },
     parsing: { icon: '🧠', label: 'Архитектор анализирует описание...', color: 'text-purple-400' },
-    building: { icon: '🔧', label: 'Строитель генерирует код...', color: 'text-cyan-400' },
+    building: { icon: '🔧', label: 'Строитель генерирует SimTalk...', color: 'text-cyan-400' },
     executing: { icon: '⚡', label: 'Исполнитель создаёт модель...', color: 'text-green-400' },
     researching: { icon: '🔬', label: 'Исследователь изучает API...', color: 'text-amber-400' },
-    done: { icon: '✅', label: 'Модель построена!', color: 'text-green-400' },
+    testing: { icon: '🔧', label: 'Самотестирование...', color: 'text-amber-400' },
+    done: { icon: '✅', label: 'Модель создана и сохранена!', color: 'text-green-400' },
     error: { icon: '❌', label: 'Ошибка — смотрите логи', color: 'text-red-400' },
   }
   const info = stateInfo[appState]
 
   return (
     <div className="space-y-4">
-      {/* State Banner */}
       <div className="rounded-xl bg-gray-900 border border-gray-800 p-6 text-center">
         <div className="text-4xl mb-2">{info.icon}</div>
         <div className={`text-lg font-semibold ${info.color}`}>{info.label}</div>
-        {appState !== 'idle' && (
-          <div className="mt-4 flex justify-center gap-1">
-            {['connecting', 'parsing', 'building', 'executing'].map((s, i) => (
-              <div
-                key={s}
-                className={`h-1.5 w-12 rounded-full transition-colors ${
-                  ['connecting', 'parsing', 'building', 'executing'].indexOf(appState) >= i
-                    ? 'bg-blue-500'
-                    : 'bg-gray-700'
-                }`}
-              />
-            ))}
-          </div>
-        )}
       </div>
 
-      {/* Live Log Preview */}
       <div className="rounded-xl bg-gray-900 border border-gray-800 overflow-hidden">
         <div className="px-4 py-2 border-b border-gray-800 flex items-center justify-between">
           <span className="text-sm text-gray-400">Живой журнал</span>
@@ -446,7 +482,7 @@ function ControlPanel({ appState, logs, logEndRef }: {
         <div className="p-3 max-h-[400px] overflow-y-auto font-mono text-xs space-y-0.5">
           {logs.length === 0 && (
             <div className="text-gray-600 text-center py-8">
-              {appState === 'idle' ? 'Нажмите "Запустить агента" для начала работы' : 'Ожидание логов...'}
+              {appState === 'idle' ? 'Нажмите "Запустить" для начала работы' : 'Ожидание логов...'}
             </div>
           )}
           {logs.slice(-50).map(entry => (
@@ -469,12 +505,14 @@ function LogLine({ entry }: { entry: LogEntry }) {
   }
   const agentColors: Record<string, string> = {
     SYSTEM: 'bg-gray-700',
-    ARCHITECT: 'bg-purple-700',
-    BUILDER: 'bg-cyan-700',
-    EXECUTOR: 'bg-blue-700',
-    DEBUGGER: 'bg-amber-700',
-    RESEARCHER: 'bg-pink-700',
-    PARSER: 'bg-teal-700',
+    Supervisor: 'bg-indigo-700',
+    Architect: 'bg-purple-700',
+    Builder: 'bg-cyan-700',
+    Executor: 'bg-blue-700',
+    Debugger: 'bg-amber-700',
+    Researcher: 'bg-pink-700',
+    Validator: 'bg-green-700',
+    TEST: 'bg-teal-700',
   }
   return (
     <div className="flex items-start gap-2 py-0.5 hover:bg-gray-800/30 px-1 rounded">
@@ -488,59 +526,72 @@ function LogLine({ entry }: { entry: LogEntry }) {
   )
 }
 
-function ModelView({ objects }: { objects: ModelObject[] }) {
-  if (objects.length === 0) {
-    return (
-      <div className="rounded-xl bg-gray-900 border border-gray-800 p-12 text-center">
-        <div className="text-4xl mb-3">🏗️</div>
-        <div className="text-gray-400">Модель пока пуста</div>
-        <div className="text-xs text-gray-600 mt-1">Запустите агента для создания модели</div>
-      </div>
-    )
+function AgentsView({ agents }: { agents: Record<string, string> }) {
+  const agentDescriptions: Record<string, { desc: string; tasks: string[] }> = {
+    Supervisor: {
+      desc: 'Координирует работу всех агентов, распределяет задачи',
+      tasks: ['Управление конвейером', 'Распределение задач', 'Мониторинг статусов'],
+    },
+    Architect: {
+      desc: 'Парсит текстовое описание в JSON-спецификацию',
+      tasks: ['LLM парсинг', 'Fallback regex', 'Валидация спецификации'],
+    },
+    Builder: {
+      desc: 'Генерирует SimTalk код из JSON-спецификации',
+      tasks: ['Генерация createObject', 'Генерация Connector.connect', 'Установка параметров'],
+    },
+    Executor: {
+      desc: 'Выполняет код через COM/REST/Files',
+      tasks: ['Выполнение SimTalk', 'Обработка ошибок', 'Повторные попытки'],
+    },
+    Debugger: {
+      desc: 'Анализирует ошибки и ищет решения',
+      tasks: ['Анализ ошибок', 'Поиск в базе знаний', 'Генерация исправлений'],
+    },
+    Researcher: {
+      desc: 'Исследует API, тестирует методы',
+      tasks: ['Тестирование методов', 'Интроспекция', 'Накопление знаний'],
+    },
+    Validator: {
+      desc: 'Проверяет корректность созданной модели',
+      tasks: ['Подсчёт объектов', 'Проверка соединений', 'Валидация параметров'],
+    },
   }
 
   return (
-    <div className="rounded-xl bg-gray-900 border border-gray-800 p-6">
-      <h3 className="text-sm font-medium text-gray-300 mb-4">Схема модели</h3>
-      <div className="flex items-center gap-2 overflow-x-auto pb-4">
-        {objects.map((obj, i) => (
-          <div key={obj.name} className="flex items-center gap-2">
-            <div className={`shrink-0 rounded-xl border p-4 text-center min-w-[120px] ${
-              obj.connected
-                ? 'bg-green-950/30 border-green-700/40'
-                : 'bg-gray-800 border-gray-700'
-            }`}>
-              <div className="text-2xl mb-1">
-                {obj.class === 'Source' ? '📦' : obj.class === 'Station' ? '⚙️' : obj.class === 'Buffer' ? '📋' : '🚪'}
+    <div className="space-y-4">
+      <div className="rounded-xl bg-gray-900 border border-gray-800 p-6">
+        <h3 className="text-lg font-semibold text-white mb-4">Архитектура параллельных агентов</h3>
+        <div className="bg-gray-950 rounded-lg p-4 text-sm text-gray-300">
+          <p className="mb-2">Система использует <strong>7 специализированных агентов</strong>, работающих параллельно:</p>
+          <ul className="space-y-1 list-disc list-inside text-xs text-gray-400">
+            <li>Каждый агент имеет свою зону ответственности</li>
+            <li>Агенты работают асинхронно через asyncio</li>
+            <li>База знаний накапливает опыт и решения</li>
+            <li>При ошибках автоматически запускается отладка</li>
+          </ul>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {Object.entries(agentDescriptions).map(([name, info]) => (
+          <div key={name} className="rounded-xl bg-gray-900 border border-gray-800 p-4">
+            <div className="flex items-center gap-3 mb-3">
+              <AgentIcon name={name} />
+              <div>
+                <h4 className="font-semibold text-white">{name}</h4>
+                <AgentBadge status={agents[name] || 'idle'} />
               </div>
-              <div className="text-xs font-medium text-white">{obj.name}</div>
-              <div className="text-[10px] text-gray-400">{obj.class}</div>
-              {Object.entries(obj.params).map(([k, v]) => (
-                <div key={k} className="text-[10px] text-gray-500">{k}: {v}</div>
+            </div>
+            <p className="text-xs text-gray-400 mb-3">{info.desc}</p>
+            <div className="space-y-1">
+              {info.tasks.map((task, i) => (
+                <div key={i} className="text-xs text-gray-500 flex items-center gap-2">
+                  <span className="w-1 h-1 rounded-full bg-gray-600"></span>
+                  {task}
+                </div>
               ))}
             </div>
-            {i < objects.length - 1 && (
-              <div className={`text-lg ${obj.connected ? 'text-green-400' : 'text-gray-600'}`}>
-                {obj.connected ? '→' : '⇢'}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
-      
-      {/* Object list */}
-      <div className="mt-4 space-y-2">
-        {objects.map(obj => (
-          <div key={obj.name} className="flex items-center gap-3 p-2 rounded-lg bg-gray-800/50 text-xs">
-            <span className={`w-2 h-2 rounded-full ${obj.connected ? 'bg-green-400' : 'bg-yellow-400'}`} />
-            <span className="text-gray-200 font-medium">{obj.name}</span>
-            <span className="text-gray-500">{obj.class}</span>
-            <span className="text-gray-600 ml-auto">
-              {Object.entries(obj.params).map(([k, v]) => `${k}=${v}`).join(', ') || 'без параметров'}
-            </span>
-            <span className={`px-1.5 py-0.5 rounded text-[10px] ${obj.connected ? 'bg-green-800/40 text-green-300' : 'bg-yellow-800/40 text-yellow-300'}`}>
-              {obj.connected ? 'соединён' : 'нет связи'}
-            </span>
           </div>
         ))}
       </div>
@@ -548,63 +599,188 @@ function ModelView({ objects }: { objects: ModelObject[] }) {
   )
 }
 
-function ResearchView({ results }: { results: ResearchResult[] }) {
-  if (results.length === 0) {
+function SpecView({ spec }: { spec: Spec | null }) {
+  if (!spec) {
     return (
       <div className="rounded-xl bg-gray-900 border border-gray-800 p-12 text-center">
-        <div className="text-4xl mb-3">🔬</div>
-        <div className="text-gray-400">Исследование не запущено</div>
-        <div className="text-xs text-gray-600 mt-1">Нажмите 🔬 для авто-исследования API Plant Simulation</div>
-        <div className="mt-6 text-left bg-gray-950 rounded-lg p-4 text-xs text-gray-500 max-w-md mx-auto">
-          <p className="mb-2">Исследователь автоматически:</p>
-          <ul className="space-y-1 list-disc list-inside">
-            <li>Создаёт тестовые объекты</li>
-            <li>Пробует все известные методы соединений</li>
-            <li>Тестирует новые комбинации API</li>
-            <li>Записывает рабочие и нерабочие методы</li>
-            <li>Интроспекция атрибутов объектов</li>
-          </ul>
-        </div>
+        <div className="text-4xl mb-3">📄</div>
+        <div className="text-gray-400">JSON-спецификация пока пуста</div>
       </div>
     )
   }
 
-  const success = results.filter(r => r.success).length
-  const failed = results.filter(r => !r.success).length
+  return (
+    <div className="rounded-xl bg-gray-900 border border-gray-800 overflow-hidden">
+      <div className="px-4 py-2 border-b border-gray-800 flex items-center justify-between">
+        <span className="text-sm text-gray-400">JSON-спецификация</span>
+        <button
+          onClick={() => navigator.clipboard.writeText(JSON.stringify(spec, null, 2))}
+          className="text-xs text-gray-500 hover:text-white px-2 py-1 rounded hover:bg-gray-800"
+        >
+          📋 Копировать
+        </button>
+      </div>
+      <div className="p-4 max-h-[600px] overflow-y-auto">
+        <pre className="text-sm font-mono text-green-300 whitespace-pre-wrap">
+          {JSON.stringify(spec, null, 2)}
+        </pre>
+      </div>
+    </div>
+  )
+}
+
+function CodeView({ code }: { code: string }) {
+  if (!code) {
+    return (
+      <div className="rounded-xl bg-gray-900 border border-gray-800 p-12 text-center">
+        <div className="text-4xl mb-3">💻</div>
+        <div className="text-gray-400">SimTalk код пока не сгенерирован</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="rounded-xl bg-gray-900 border border-gray-800 overflow-hidden">
+      <div className="px-4 py-2 border-b border-gray-800 flex items-center justify-between">
+        <span className="text-sm text-gray-400">Сгенерированный SimTalk код</span>
+        <button
+          onClick={() => navigator.clipboard.writeText(code)}
+          className="text-xs text-gray-500 hover:text-white px-2 py-1 rounded hover:bg-gray-800"
+        >
+          📋 Копировать
+        </button>
+      </div>
+      <div className="p-4 max-h-[600px] overflow-y-auto">
+        <pre className="text-sm font-mono text-cyan-300 whitespace-pre-wrap">
+          {code}
+        </pre>
+      </div>
+    </div>
+  )
+}
+
+function ModelView({ spec }: { spec: Spec | null }) {
+  if (!spec || spec.objects.length === 0) {
+    return (
+      <div className="rounded-xl bg-gray-900 border border-gray-800 p-12 text-center">
+        <div className="text-4xl mb-3">🏗️</div>
+        <div className="text-gray-400">Модель пока пуста</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="rounded-xl bg-gray-900 border border-gray-800 p-6">
+      <h3 className="text-sm font-medium text-gray-300 mb-4">Схема модели</h3>
+      
+      <div className="relative bg-gray-950 rounded-lg p-6 min-h-[200px] overflow-x-auto">
+        <div className="flex items-center gap-4">
+          {spec.objects.map((obj, i) => (
+            <div key={obj.name} className="flex items-center gap-4">
+              <div className="shrink-0 rounded-xl border border-blue-700/40 bg-blue-950/30 p-4 text-center min-w-[120px]">
+                <div className="text-2xl mb-1">
+                  {obj.class === 'Source' ? '📦' : obj.class === 'Station' ? '⚙️' : obj.class === 'Buffer' ? '📋' : '🚪'}
+                </div>
+                <div className="text-xs font-medium text-white">{obj.name}</div>
+                <div className="text-[10px] text-gray-400">{obj.class}</div>
+                <div className="text-[10px] text-gray-500 mt-1">({obj.x}, {obj.y})</div>
+                {Object.entries(obj.params).map(([k, v]) => (
+                  <div key={k} className="text-[10px] text-gray-500">{k}: {v}</div>
+                ))}
+              </div>
+              {i < spec.objects.length - 1 && (
+                <div className="text-lg text-green-400">→</div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function KnowledgeView() {
+  const [methods, setMethods] = useState<KnowledgeMethod[]>([])
+  const [classes, setClasses] = useState<KnowledgeClass[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const [mRes, cRes] = await Promise.all([
+          fetch(`${API_BASE}/knowledge/methods`),
+          fetch(`${API_BASE}/knowledge/classes`),
+        ])
+        setMethods(await mRes.json())
+        setClasses(await cRes.json())
+      } catch (err) {
+        console.error('Ошибка загрузки базы знаний:', err)
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
+  }, [])
+
+  if (loading) {
+    return (
+      <div className="rounded-xl bg-gray-900 border border-gray-800 p-12 text-center">
+        <div className="text-4xl mb-3 animate-pulse">🧠</div>
+        <div className="text-gray-400">Загрузка базы знаний...</div>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-4">
-      <div className="flex gap-4">
-        <div className="flex-1 rounded-xl bg-green-950/20 border border-green-800/30 p-4 text-center">
-          <div className="text-2xl font-bold text-green-400">{success}</div>
-          <div className="text-xs text-green-300">Работает</div>
+      <div className="rounded-xl bg-gray-900 border border-gray-800 p-6">
+        <h3 className="text-lg font-semibold text-white mb-2">🧠 База знаний</h3>
+        <p className="text-sm text-gray-400">
+          Система накапливает опыт работы с Plant Simulation API. 
+          При ошибках автоматически ищет решения в базе.
+        </p>
+      </div>
+
+      {/* Methods */}
+      <div className="rounded-xl bg-gray-900 border border-gray-800 overflow-hidden">
+        <div className="px-4 py-2 border-b border-gray-800">
+          <span className="text-sm text-gray-400">Методы API ({methods.length})</span>
         </div>
-        <div className="flex-1 rounded-xl bg-red-950/20 border border-red-800/30 p-4 text-center">
-          <div className="text-2xl font-bold text-red-400">{failed}</div>
-          <div className="text-xs text-red-300">Не работает</div>
-        </div>
-        <div className="flex-1 rounded-xl bg-blue-950/20 border border-blue-800/30 p-4 text-center">
-          <div className="text-2xl font-bold text-blue-400">{results.length}</div>
-          <div className="text-xs text-blue-300">Всего проверено</div>
+        <div className="divide-y divide-gray-800 max-h-[300px] overflow-y-auto">
+          {methods.map((method, i) => (
+            <div key={i} className="p-3 hover:bg-gray-800/30">
+              <div className="flex items-center gap-2 mb-1">
+                <span className={method.success_rate > 0.8 ? 'text-green-400' : method.success_rate > 0.5 ? 'text-yellow-400' : 'text-red-400'}>
+                  {method.success_rate > 0.8 ? '✅' : method.success_rate > 0.5 ? '⚠️' : '❌'}
+                </span>
+                <span className="text-sm text-white font-medium">{method.name}</span>
+                <span className="text-xs text-gray-500 ml-auto">
+                  {Math.round(method.success_rate * 100)}% ({method.successes}/{method.attempts})
+                </span>
+              </div>
+              <code className="text-[11px] text-cyan-300 font-mono block truncate">{method.template}</code>
+              {method.notes && <div className="text-[11px] text-gray-500 mt-1">{method.notes}</div>}
+            </div>
+          ))}
         </div>
       </div>
 
+      {/* Classes */}
       <div className="rounded-xl bg-gray-900 border border-gray-800 overflow-hidden">
         <div className="px-4 py-2 border-b border-gray-800">
-          <span className="text-sm text-gray-400">Результаты исследования API</span>
+          <span className="text-sm text-gray-400">Классы объектов ({classes.length})</span>
         </div>
-        <div className="divide-y divide-gray-800 max-h-[500px] overflow-y-auto">
-          {results.map((r, i) => (
+        <div className="divide-y divide-gray-800 max-h-[300px] overflow-y-auto">
+          {classes.map((cls, i) => (
             <div key={i} className="p-3 hover:bg-gray-800/30">
               <div className="flex items-center gap-2 mb-1">
-                <span className={r.success ? 'text-green-400' : 'text-red-400'}>
-                  {r.success ? '✅' : '❌'}
+                <span className={cls.verified ? 'text-green-400' : 'text-yellow-400'}>
+                  {cls.verified ? '✅' : '⚠️'}
                 </span>
-                <span className="text-sm text-white font-medium">{r.method}</span>
-                <span className="text-[10px] text-gray-600 ml-auto">{r.time}ms</span>
+                <span className="text-sm text-white font-medium">{cls.name}</span>
               </div>
-              <code className="text-[11px] text-cyan-300 font-mono block mb-1 truncate">{r.code}</code>
-              {r.error && <div className="text-[11px] text-red-400 truncate">{r.error}</div>}
+              <code className="text-[11px] text-cyan-300 font-mono block truncate">{cls.create_method}</code>
+              {cls.notes && <div className="text-[11px] text-gray-500 mt-1">{cls.notes}</div>}
             </div>
           ))}
         </div>
@@ -631,16 +807,4 @@ function LogsView({ logs, logEndRef }: { logs: LogEntry[]; logEndRef: React.RefO
       </div>
     </div>
   )
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────
-
-function getDefaultAgents(): AgentStatus[] {
-  return [
-    { name: 'Архитектор', icon: '🏗️', status: 'idle', detail: 'Ожидание' },
-    { name: 'Строитель', icon: '🔨', status: 'idle', detail: 'Ожидание' },
-    { name: 'Исполнитель', icon: '⚡', status: 'idle', detail: 'Ожидание' },
-    { name: 'Отладчик', icon: '🐛', status: 'idle', detail: 'Ожидание' },
-    { name: 'Исследователь', icon: '🔬', status: 'idle', detail: 'Ожидание' },
-  ]
 }
