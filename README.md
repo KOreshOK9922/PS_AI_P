@@ -3,6 +3,53 @@
 **Версия:** 2.0  
 **Статус:** Рабочий прототип с параллельными агентами и базой знаний
 
+## 🚀 Быстрый старт для Windows
+
+### ⚡ Самый простой способ
+
+1. **Двойной клик** на `install_windows.bat` — автоматическая установка
+2. **Двойной клик** на `start_server.bat` — запуск системы
+3. Откройте браузер: **http://localhost:7860**
+
+### 📋 Ручная установка
+
+```powershell
+# 1. Разрешите выполнение скриптов
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+# 2. Установите зависимости
+cd backend
+pip install -r requirements.txt
+cd ..
+npm install
+
+# 3. Соберите фронтенд
+npm run build
+
+# 4. Запустите систему
+cd backend
+python main.py
+```
+
+### 🔧 Решение проблем
+
+Если возникли ошибки при установке:
+
+- **pywin32==306 not found** → `pip install pywin32`
+- **npm.ps1 cannot be loaded** → `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser`
+- **requirements.txt not found** → `cd backend` перед установкой
+
+**Подробные инструкции:**
+- 📘 [INSTALL_WINDOWS.md](INSTALL_WINDOWS.md) — полная инструкция для Windows
+- 📗 [QUICKSTART.md](QUICKSTART.md) — быстрый старт
+- 📕 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — решение проблем
+
+### 🩺 Диагностика
+
+Запустите `diagnose.bat` для проверки всех компонентов системы.
+
+---
+
 ## 🎯 Что нового в v2.0
 
 ### Параллельные агенты
