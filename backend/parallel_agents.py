@@ -250,19 +250,15 @@ class BuilderAgent(BaseAgent):
         code_lines.append('f := .Models.Model')
         code_lines.append('')
         
-        # Создание объектов
+        # Создание объектов — ВСЕГДА генерируем код сами с реальными координатами
         for obj in spec["objects"]:
             class_name = obj["class"]
             obj_name = obj["name"]
             x = obj["x"]
             y = obj["y"]
             
-            # Получаем информацию о классе из базы знаний
-            class_info = kb.get_object_class_info(class_name)
-            if class_info:
-                create_method = class_info["create_method"]
-            else:
-                create_method = f".MaterialFlow.{class_name}.createObject(f, {x}, {y})"
+            # Генерируем правильный код с реальными координатами
+            create_method = f".MaterialFlow.{class_name}.createObject(f, {x}, {y})"
             
             code_lines.append(f'var {obj_name} : object')
             code_lines.append(f'{obj_name} := {create_method}')
@@ -546,22 +542,32 @@ class ValidatorAgent(BaseAgent):
     async def _run(self, spec: dict) -> AgentResult:
         self.log("INFO", self.name, "Валидация модели")
         
-        # Создаём DataTable для подсчёта
-        count_code = f"""
+        # Правильный подсчёт: создаём таблицу ПОСЛЕ подсчёта объектов
+        # И считаем только объекты MaterialFlow, исключая коннекторы и служебные объекты
+        count_code = """
 var f : object
 f := .Models.Model
 
+var count : integer
+count := 0
+
+var i : integer
+var obj : object
+
+for i := 1 to f.numObjects loop
+    obj := f.child(i)
+    if obj.className = "Source" or obj.className = "Station" or obj.className = "Buffer" or obj.className = "Drain" or obj.className = "Line" or obj.className = "ParallelStation" then
+        count := count + 1
+    end
+end
+
 var dt : object
 dt := .InformationFlow.DataTable.createObject(f, "VALIDATION_TABLE")
-
-var count : integer
-count := f.numObjects
-
 dt.setCell(1, 1, count)
 """
         success, error = self.ps.execute(count_code)
         if not success:
-            self.log("ERROR", self.name, f"Ошибка создания таблицы: {error}")
+            self.log("ERROR", self.name, f"Ошибка подсчёта: {error}")
             return AgentResult(success=False, error=error)
         
         # Читаем количество объектов
@@ -569,15 +575,14 @@ dt.setCell(1, 1, count)
             actual_count = self.ps.app.GetTableCell(".Models.Model.VALIDATION_TABLE", 1, 1)
             expected_count = len(spec["objects"])
             
+            # Удаляем служебную таблицу
+            self.ps.execute(".Models.Model.VALIDATION_TABLE.deleteObject")
+            
             if actual_count != expected_count:
                 self.log("ERROR", self.name, f"Ожидалось {expected_count}, найдено {actual_count}")
                 return AgentResult(success=False, error="Неверное количество объектов")
             
             self.log("SUCCESS", self.name, f"Найдено {actual_count} объектов")
-            
-            # Удаляем таблицу
-            self.ps.execute(".Models.Model.VALIDATION_TABLE.deleteObject")
-            
             return AgentResult(success=True)
             
         except Exception as e:

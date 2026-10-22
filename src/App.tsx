@@ -16,7 +16,7 @@ interface Task {
   created_at: string
 }
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = 'http://localhost:7860'
 
 export default function App() {
   const [requirement, setRequirement] = useState('')
@@ -54,8 +54,8 @@ export default function App() {
     const poll = async () => {
       try {
         const [logsRes, statusRes] = await Promise.all([
-          fetch(`${API_BASE}/api/logs/${taskId}?after=${logIdRef.current}`),
-          fetch(`${API_BASE}/api/status/${taskId}`)
+          fetch(`${API_BASE}/logs?after=${logIdRef.current}`),
+          fetch(`${API_BASE}/status`)
         ])
         
         const newLogs: LogEntry[] = await logsRes.json()
@@ -88,7 +88,7 @@ export default function App() {
     if (!requirement.trim()) return
 
     try {
-      const r = await fetch(`${API_BASE}/api/run`, {
+      const r = await fetch(`${API_BASE}/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
