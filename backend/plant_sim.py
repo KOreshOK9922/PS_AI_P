@@ -84,7 +84,8 @@ class PlantSimConnection:
     def _try_com_connection(self) -> bool:
         """Попытка подключения через COM"""
         try:
-            self._kill_zombie_processes()
+            # НЕ вызываем _kill_zombie_processes() здесь — это убивает PS при health check!
+            # Zombie-процессы убиваются только при явном запросе на выполнение
             
             pythoncom.CoInitialize()
             self.app = win32com.client.Dispatch("Tecnomatix.PlantSimulation.RemoteControl")
@@ -234,24 +235,31 @@ class PlantSimConnection:
             return False, str(e)
     
     def _demo_execute(self, code: str) -> Tuple[bool, str]:
-        """Демо-режим"""
+        """Демо-режим — честная эмуляция Plant Simulation"""
         time.sleep(0.05)
         
-        # Проверяем синтаксис
-        if "createObject" in code:
+        # Проверяем известные ошибки
+        if "SingleProc" in code or "ParallelProc" in code:
+            return False, "Unknown identifier 'SingleProc' (use Station instead)"
+        elif ".succ :=" in code:
+            return False, "cannot assign to left hand side (succ is read-only)"
+        elif ".create(" in code and "createObject" not in code:
+            return False, "Unknown identifier 'create' (use createObject instead)"
+        elif "obj.name :=" in code:
+            return False, "cannot assign to left hand side (use setName instead)"
+        
+        # Проверяем правильный синтаксис
+        if "createObject" in code and ".Models.Model" in code:
             return True, ""
         elif "Connector.connect" in code:
             return True, ""
         elif "setName" in code:
             return True, ""
-        elif ":=" in code and ".Models.Model" in code:
+        elif ":=" in code and "f." in code:
             return True, ""
-        elif "SingleProc" in code or "ParallelProc" in code:
-            return False, "Unknown identifier 'SingleProc'"
-        elif ".succ :=" in code:
-            return False, "cannot assign to left hand side"
         
-        return True, ""
+        # Если код не содержит известных конструкций — возвращаем ошибку
+        return False, "Demo mode: code does not contain recognized Plant Simulation constructs"
     
     def save_model(self, path: str) -> Tuple[bool, str]:
         """Сохраняет модель"""

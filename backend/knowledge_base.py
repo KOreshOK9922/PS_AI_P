@@ -24,7 +24,7 @@ class KnowledgeBase:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS api_methods (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    method_name TEXT NOT NULL,
+                    method_name TEXT NOT NULL UNIQUE,
                     code_template TEXT NOT NULL,
                     success_rate REAL DEFAULT 0.0,
                     attempts INTEGER DEFAULT 0,
@@ -38,7 +38,7 @@ class KnowledgeBase:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS error_patterns (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    error_message TEXT NOT NULL,
+                    error_message TEXT NOT NULL UNIQUE,
                     solution TEXT,
                     frequency INTEGER DEFAULT 1,
                     last_seen TEXT,
@@ -73,44 +73,17 @@ class KnowledgeBase:
             conn.commit()
     
     def _init_known_facts(self, conn):
-        """Инициализация подтверждённых фактов"""
-        cursor = conn.execute("SELECT COUNT(*) FROM object_classes")
-        if cursor.fetchone()[0] == 0:
-            # Известные рабочие классы
-            classes = [
-                ("Source", ".MaterialFlow.Source.createObject(f, x, y)", "interval", "Источник объектов"),
-                ("Station", ".MaterialFlow.Station.createObject(f, x, y)", "procTime", "Станция обработки"),
-                ("Buffer", ".MaterialFlow.Buffer.createObject(f, x, y)", "capacity", "Буфер/накопитель"),
-                ("Drain", ".MaterialFlow.Drain.createObject(f, x, y)", None, "Сход/выход"),
-                ("Line", ".MaterialFlow.Line.createObject(f, x, y)", None, "Линия"),
-                ("ParallelStation", ".MaterialFlow.ParallelStation.createObject(f, x, y)", "numStations", "Параллельная станция"),
-            ]
-            
-            for class_name, create_method, params, notes in classes:
-                conn.execute(
-                    "INSERT INTO object_classes (class_name, create_method, required_params, notes, verified) VALUES (?, ?, ?, ?, 1)",
-                    (class_name, create_method, params, notes)
-                )
-            
-            # Известные рабочие методы
-            methods = [
-                ("createObject", "obj := .MaterialFlow.{class}.createObject(f, {x}, {y})", 0.95, "Создание объектов"),
-                ("setName", 'obj.setName("{name}")', 1.0, "Переименование объектов"),
-                ("Connector.connect", ".MaterialFlow.Connector.connect(obj1, obj2)", 0.90, "Создание соединений"),
-                ("deleteObject", "obj.deleteObject", 1.0, "Удаление объектов"),
-                ("setParameter", "f.{obj}.{param} := {value}", 0.98, "Установка параметров"),
-            ]
-            
-            for name, template, rate, notes in methods:
-                conn.execute(
-                    "INSERT INTO api_methods (method_name, code_template, success_rate, notes) VALUES (?, ?, ?, ?)",
-                    (name, template, rate, notes)
-                )
+        """Инициализация базы знаний — НЕ заполняем предзаполненными данными.
+        Система сама накапливает знания через тестирование и использование."""
+        # База знаний начинается пустой — агенты сами накапливают опыт
+        # Это честно: verified=0 означает "не проверено"
+        pass
     
     def record_attempt(self, method_name: str, success: bool):
         """Записывает попытку использования метода"""
         with self.lock:
             with sqlite3.connect(self.db_path) as conn:
+                success_val = 1 if success else 0
                 conn.execute("""
                     INSERT INTO api_methods (method_name, code_template, attempts, successes, last_used)
                     VALUES (?, '', 1, ?, datetime('now'))
@@ -119,7 +92,7 @@ class KnowledgeBase:
                         successes = successes + ?,
                         last_used = datetime('now'),
                         success_rate = CAST(successes AS REAL) / attempts
-                """, (method_name, 1 if success else 0, 1 if success else 0))
+                """, (method_name, success_val, success_val))
     
     def record_error(self, error_message: str, solution: Optional[str] = None):
         """Записывает ошибку и возможное решение"""

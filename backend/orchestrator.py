@@ -26,6 +26,7 @@ from parallel_agents import (
 )
 from plant_sim import PlantSimConnection
 from knowledge_base import kb
+from llm_client import OllamaClient
 
 
 class Orchestrator:
@@ -46,12 +47,16 @@ class Orchestrator:
         # Подключение к Plant Simulation
         self.ps = PlantSimConnection()
         
+        # Инициализация LLM клиента
+        self.llm = OllamaClient()
+        
         # Создаём агентов, специализированных на Plant Simulation
-        self.supervisor = SupervisorAgent(self.log, self.ps)
-        self.architect = ArchitectAgent(self.log)
+        # Передаём OllamaClient агентам которые его используют
+        self.supervisor = SupervisorAgent(self.log, self.ps, self.llm)
+        self.architect = ArchitectAgent(self.log, self.llm)  # ← LLM для парсинга
         self.builder = BuilderAgent(self.log)
         self.executor = ExecutorAgent(self.log, self.ps)
-        self.debugger = DebuggerAgent(self.log)
+        self.debugger = DebuggerAgent(self.log, self.llm)  # ← LLM для отладки
         self.researcher = ResearcherAgent(self.log, self.ps)
         self.validator = ValidatorAgent(self.log, self.ps)
         
